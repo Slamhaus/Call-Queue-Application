@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const http = require('http');
@@ -23,6 +24,25 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Serve hold music from root directory
 app.use('/hold-music', express.static(__dirname));
 
+// Load credentials from environment if available
+const envCredentials = (process.env.SIGNALWIRE_PROJECT_ID &&
+                        process.env.SIGNALWIRE_API_TOKEN &&
+                        process.env.SIGNALWIRE_SPACE_NAME)
+    ? {
+        projectId: process.env.SIGNALWIRE_PROJECT_ID,
+        apiToken: process.env.SIGNALWIRE_API_TOKEN,
+        spaceName: process.env.SIGNALWIRE_SPACE_NAME,
+        phoneNumber: process.env.SIGNALWIRE_PHONE_NUMBER || null
+    }
+    : null;
+
+if (envCredentials) {
+    console.log('SignalWire credentials loaded from environment variables');
+    if (envCredentials.phoneNumber) {
+        console.log(`Phone number configured: ${envCredentials.phoneNumber}`);
+    }
+}
+
 // In-memory state
 const state = {
     queues: {
@@ -30,7 +50,7 @@ const state = {
         support: []
     },
     agents: new Map(), // agentId -> { name, status, currentCall, wsClient }
-    signalwireCredentials: null // { spaceName, projectId, apiToken }
+    signalwireCredentials: envCredentials // { spaceName, projectId, apiToken }
 };
 
 // Fetch call details from SignalWire API
@@ -402,6 +422,27 @@ app.get('/swml/hangup', (req, res) => {
     });
 });
 
+// Config endpoint - returns credentials and detected base URL for frontend
+app.get('/api/config', (req, res) => {
+    const baseUrl = getBaseUrl(req);
+
+    if (!state.signalwireCredentials) {
+        return res.status(503).json({
+            configured: false,
+            error: 'SignalWire credentials not configured. Please set SIGNALWIRE_PROJECT_ID, SIGNALWIRE_API_TOKEN, and SIGNALWIRE_SPACE_NAME in .env file.'
+        });
+    }
+
+    res.json({
+        configured: true,
+        baseUrl: baseUrl,
+        spaceName: state.signalwireCredentials.spaceName,
+        projectId: state.signalwireCredentials.projectId,
+        apiToken: state.signalwireCredentials.apiToken,
+        phoneNumber: state.signalwireCredentials.phoneNumber
+    });
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.json({
@@ -434,16 +475,21 @@ app.get('/debug/state', (req, res) => {
 
 // Start server
 server.listen(PORT, () => {
+    const credStatus = state.signalwireCredentials
+        ? '✓ Credentials loaded from .env'
+        : '✗ Missing credentials - create .env file';
+
     console.log(`
 ╔════════════════════════════════════════════════════════════╗
 ║           SignalWire Call Queue Server                     ║
 ╠════════════════════════════════════════════════════════════╣
 ║  Server running on http://localhost:${PORT}                   ║
+║  ${credStatus.padEnd(50)}║
 ║                                                            ║
 ║  Next steps:                                               ║
 ║  1. Run ngrok: ngrok http ${PORT}                             ║
-║  2. Open http://localhost:${PORT} in your browser             ║
-║  3. Enter your SignalWire credentials and ngrok URL        ║
+║  2. Open ngrok URL in your browser                         ║
+║  3. Enter your agent name and click Connect                ║
 ║  4. Assign the IVR resource to your phone number           ║
 ╚════════════════════════════════════════════════════════════╝
     `);

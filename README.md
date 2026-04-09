@@ -24,21 +24,21 @@ A browser-based call queue application using SignalWire's SWML. Callers dial in,
    npm install
    ```
 
-2. Start the server:
+2. Copy `.env.example` to `.env` and add your SignalWire credentials
+
+3. Start the server:
    ```bash
    npm start
    ```
 
-3. Start ngrok in another terminal:
+4. Start ngrok in another terminal:
    ```bash
    ngrok http 3000
    ```
 
-4. Open http://localhost:3000 in your browser
+5. Open the ngrok URL in your browser
 
-5. Enter your SignalWire credentials and ngrok URL, then click Connect
-
-6. In the SignalWire dashboard, assign the `queue-inbound-ivr` resource to your phone number
+6. Enter your agent name and click **Connect**
 
 ## Usage
 
@@ -51,10 +51,11 @@ A browser-based call queue application using SignalWire's SWML. Callers dial in,
 ## Project Structure
 
 ```
-Queue/
+Call_Queue_Dev/
 ├── server.js          # Express + WebSocket server, SWML endpoints
 ├── public/
 │   └── index.html     # Agent web UI
+├── .env.example       # Environment variable template
 └── package.json
 ```
 
@@ -62,6 +63,7 @@ Queue/
 
 | Endpoint | Description |
 |----------|-------------|
+| `GET /api/config` | Returns server configuration for frontend |
 | `POST /swml/ivr` | Returns IVR SWML for inbound calls |
 | `POST /swml/agent-connector` | Returns SWML for agent queue connection |
 | `POST /swml/hangup` | Returns hangup SWML |
@@ -71,4 +73,4 @@ Queue/
 
 ## Changing ngrok URL
 
-When your ngrok URL changes, just reconnect in the browser. The app automatically updates the webhook URLs in SignalWire.
+When your ngrok URL changes, just reconnect in the browser. The app automatically detects the new URL and updates the webhook URLs in SignalWire.
