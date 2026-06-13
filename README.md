@@ -1,6 +1,6 @@
 # SignalWire Call Queue
 
-A browser-based call queue application using SignalWire's SWML. Callers dial in, choose Sales or Support via IVR, and wait in a queue. Agents see queued calls in real-time and can connect with one click.
+A browser-based call queue application using SignalWire's SWML. Callers dial in, choose Sales or Support via IVR, and wait in a queue. Agents see queued calls in real-time and can connect, hold, transfer, or hang up with one click.
 
 ## Features
 
@@ -8,7 +8,7 @@ A browser-based call queue application using SignalWire's SWML. Callers dial in,
 - Real-time queue display with caller info and wait times
 - Multi-agent support with status indicators
 - Audio notification when calls enter the queue
-- Visual feedback during call connection (Connecting... → Hang Up)
+- Active call controls: Hold / Resume, Transfer, Hang Up
 - SWML Webhooks served dynamically from your server (URLs auto-update when ngrok changes)
 
 ## Prerequisites
@@ -42,11 +42,14 @@ A browser-based call queue application using SignalWire's SWML. Callers dial in,
 
 ## Usage
 
-1. **Call your SignalWire number** - You'll hear the IVR
-2. **Press 1 or 2** - Routes to Sales or Support queue
-3. **Watch the queue** - Caller appears in the agent UI
-4. **Click "Dial Queue"** - Connects you to the waiting caller
-5. **Click "Hang Up"** - Ends the call
+1. **Call your SignalWire number** — You'll hear the IVR
+2. **Press 1 or 2** — Routes to Sales or Support queue
+3. **Watch the queue** — Caller appears in the agent UI with a live wait timer
+4. **Click "Dial Sales/Support Queue"** — Connects you to the waiting caller
+5. **Use the call controls** that appear once connected:
+   - **Hold** — Pauses the call; click **Resume** to reconnect
+   - **Transfer** — Enter a destination number and click **Transfer**
+   - **Hang Up** — Ends the call
 
 ## Project Structure
 
@@ -63,10 +66,12 @@ Call_Queue_Dev/
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /api/config` | Returns server configuration for frontend |
-| `POST /swml/ivr` | Returns IVR SWML for inbound calls |
-| `POST /swml/agent-connector` | Returns SWML for agent queue connection |
-| `POST /swml/hangup` | Returns hangup SWML |
+| `GET /api/config` | Returns server configuration for the frontend |
+| `POST /api/call/command` | Proxy for SignalWire REST call commands (hold, transfer) |
+| `POST /swml/ivr` | IVR SWML for inbound calls |
+| `POST /swml/agent-connector` | SWML for agent queue connection |
+| `POST /swml/transfer` | SWML executed when transferring a caller to a PSTN number |
+| `GET  /swml/transfer` | Same as above (SignalWire may fetch via GET) |
 | `POST /webhook/queue-status` | Receives queue events from SignalWire |
 | `GET /health` | Health check |
 | `GET /debug/state` | View current queue and agent state |

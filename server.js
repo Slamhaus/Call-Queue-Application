@@ -49,6 +49,10 @@ const state = {
         sales: [],
         support: []
     },
+    dialingAgents: {       // FIFO list of agentIds currently dialing each queue
+        sales: [],
+        support: []
+    },
     agents: new Map(), // agentId -> { name, status, currentCall, wsClient }
     signalwireCredentials: envCredentials // { spaceName, projectId, apiToken }
 };
@@ -171,6 +175,39 @@ wss.on('connection', (ws) => {
                     }
                     break;
 
+                case 'agent_dialing':
+                    if (agentId && state.dialingAgents[message.queueName]) {
+                        state.dialingAgents[message.queueName].push(agentId);
+                        console.log(`Agent ${agentId} registered as dialing ${message.queueName} queue`);
+                    }
+                    break;
+
+                case 'agent_dial_cancelled':
+                    if (agentId && state.dialingAgents[message.queueName]) {
+                        const idx = state.dialingAgents[message.queueName].indexOf(agentId);
+                        if (idx !== -1) {
+                            state.dialingAgents[message.queueName].splice(idx, 1);
+                            console.log(`Agent ${agentId} removed from ${message.queueName} dialing list`);
+                        }
+                    }
+                    break;
+
+                case 'agent_leave':
+                    if (agentId && state.agents.has(agentId)) {
+                        const agent = state.agents.get(agentId);
+                        console.log(`Agent left: ${agent.name} (${agentId})`);
+                        state.agents.delete(agentId);
+
+                        Object.keys(state.dialingAgents).forEach(queueName => {
+                            const idx = state.dialingAgents[queueName].indexOf(agentId);
+                            if (idx !== -1) state.dialingAgents[queueName].splice(idx, 1);
+                        });
+
+                        broadcast({ type: 'agent_left', agentId });
+                        agentId = null;
+                    }
+                    break;
+
                 case 'request_state':
                     ws.send(JSON.stringify(getFullState()));
                     break;
@@ -179,7 +216,9 @@ wss.on('connection', (ws) => {
                     state.signalwireCredentials = {
                         spaceName: message.spaceName,
                         projectId: message.projectId,
-                        apiToken: message.apiToken
+                        apiToken: message.apiToken,
+                        // Preserve phoneNumber from env if client doesn't supply one
+                        phoneNumber: message.phoneNumber || state.signalwireCredentials?.phoneNumber || null
                     };
                     console.log('SignalWire credentials stored for API calls');
                     break;
@@ -194,6 +233,15 @@ wss.on('connection', (ws) => {
             const agent = state.agents.get(agentId);
             console.log(`Agent disconnected: ${agent.name} (${agentId})`);
             state.agents.delete(agentId);
+
+            // Clean up any pending dials if agent disconnects mid-dial
+            Object.keys(state.dialingAgents).forEach(queueName => {
+                const idx = state.dialingAgents[queueName].indexOf(agentId);
+                if (idx !== -1) {
+                    state.dialingAgents[queueName].splice(idx, 1);
+                    console.log(`Removed ${agentId} from ${queueName} dialing list (disconnected)`);
+                }
+            });
 
             broadcast({
                 type: 'agent_left',
@@ -275,12 +323,17 @@ app.post('/webhook/queue-status', async (req, res) => {
 
             if (dequeueIndex !== -1) {
                 state.queues[queueName].splice(dequeueIndex, 1);
-                console.log(`[${new Date().toISOString()}] Call ${callData.callSid} removed from ${queueName} queue (dequeued)`);
+
+                // FIFO: first agent who registered as dialing this queue gets this caller
+                const bridgedAgentId = state.dialingAgents[queueName]?.shift() || null;
+                console.log(`[${new Date().toISOString()}] Call ${callData.callSid} dequeued from ${queueName}, bridged to agent: ${bridgedAgentId}`);
 
                 broadcast({
                     type: 'call_dequeued',
                     queue: queueName,
-                    callSid: callData.callSid
+                    callSid: callData.callSid,
+                    agentId: bridgedAgentId,
+                    from: callData.from
                 });
             }
             break;
@@ -356,10 +409,7 @@ app.post('/swml/ivr', (req, res) => {
                 {
                     enter_queue: {
                         queue_name: "sales",
-                        status_url: `${baseUrl}/webhook/queue-status`,
-                        // wait_url removed for testing - using SignalWire default hold music
-                        wait_time: 3600,
-                        transfer_after_bridge: `${baseUrl}/swml/hangup`
+                        status_url: `${baseUrl}/webhook/queue-status`
                     }
                 }
             ],
@@ -368,10 +418,7 @@ app.post('/swml/ivr', (req, res) => {
                 {
                     enter_queue: {
                         queue_name: "support",
-                        status_url: `${baseUrl}/webhook/queue-status`,
-                        // wait_url removed for testing - using SignalWire default hold music
-                        wait_time: 3600,
-                        transfer_after_bridge: `${baseUrl}/swml/hangup`
+                        status_url: `${baseUrl}/webhook/queue-status`
                     }
                 }
             ]
@@ -381,16 +428,13 @@ app.post('/swml/ivr', (req, res) => {
 
 // SWML endpoint for agent connecting to queue
 app.post('/swml/agent-connector', (req, res) => {
-    const baseUrl = getBaseUrl(req);
-
     res.json({
         version: "1.0.0",
         sections: {
             main: [
                 {
                     connect: {
-                        to: "queue:%{vars.userVariables.queue_name}",
-                        transfer_after_bridge: `${baseUrl}/swml/hangup`
+                        to: "queue:%{vars.userVariables.queue_name}"
                     }
                 }
             ]
@@ -398,29 +442,37 @@ app.post('/swml/agent-connector', (req, res) => {
     });
 });
 
-// SWML endpoint for post-bridge hangup
-app.post('/swml/hangup', (req, res) => {
-    res.json({
-        version: "1.0.0",
-        sections: {
-            main: [
-                { hangup: {} }
-            ]
-        }
-    });
-});
+// SWML endpoint for transferring a caller to a PSTN number
+function handleTransferSwml(req, res) {
+    const to = req.query.to;
 
-// Also support GET for hangup (for transfer_after_bridge URL)
-app.get('/swml/hangup', (req, res) => {
+    if (!to) {
+        return res.status(400).json({ error: 'Missing to parameter' });
+    }
+
+    const from = state.signalwireCredentials?.phoneNumber;
+
+    if (!from) {
+        return res.status(503).json({ error: 'SIGNALWIRE_PHONE_NUMBER not configured' });
+    }
+
     res.json({
         version: "1.0.0",
         sections: {
             main: [
-                { hangup: {} }
+                {
+                    connect: {
+                        from: from,
+                        to: to
+                    }
+                }
             ]
         }
     });
-});
+}
+
+app.post('/swml/transfer', handleTransferSwml);
+app.get('/swml/transfer', handleTransferSwml);
 
 // Config endpoint - returns credentials and detected base URL for frontend
 app.get('/api/config', (req, res) => {
@@ -441,6 +493,52 @@ app.get('/api/config', (req, res) => {
         apiToken: state.signalwireCredentials.apiToken,
         phoneNumber: state.signalwireCredentials.phoneNumber
     });
+});
+
+// Call command proxy - authenticates and forwards REST call commands to SignalWire
+app.post('/api/call/command', async (req, res) => {
+    if (!state.signalwireCredentials) {
+        return res.status(503).json({ error: 'SignalWire credentials not configured' });
+    }
+
+    const { callSid, command, params } = req.body;
+
+    if (!callSid || !command) {
+        return res.status(400).json({ error: 'callSid and command are required' });
+    }
+
+    const { spaceName, projectId, apiToken } = state.signalwireCredentials;
+
+    try {
+        const response = await fetch(`https://${spaceName}/api/calling/calls`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Basic ' + Buffer.from(`${projectId}:${apiToken}`).toString('base64')
+            },
+            body: JSON.stringify({ command, params: { id: callSid, ...(params || {}) } })
+        });
+
+        const text = await response.text();
+        let data;
+        try {
+            data = JSON.parse(text);
+        } catch {
+            console.error(`[${new Date().toISOString()}] SignalWire returned non-JSON for '${command}':`, text.slice(0, 200));
+            return res.status(response.status).json({ error: `SignalWire API error ${response.status}` });
+        }
+
+        if (!response.ok) {
+            console.error(`[${new Date().toISOString()}] Call command '${command}' failed for ${callSid}: ${response.status}`, data);
+            return res.status(response.status).json({ error: data });
+        }
+
+        console.log(`[${new Date().toISOString()}] Call command '${command}' sent to ${callSid}`);
+        res.json({ success: true, data });
+    } catch (error) {
+        console.error('Error sending call command:', error.message);
+        res.status(500).json({ error: error.message });
+    }
 });
 
 // Health check endpoint

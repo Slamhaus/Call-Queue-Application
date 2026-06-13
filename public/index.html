@@ -236,6 +236,33 @@
             </div>
         </div>
 
+        <!-- Active Call Controls (shown only while bridged with a caller) -->
+        <div id="activeCallPanel" class="d-none mb-3">
+            <div class="card" style="border-color:#a3cfbb;">
+                <div class="card-header d-flex justify-content-between align-items-center" style="background:#d1e7dd;">
+                    <strong>Active Call</strong>
+                    <span id="activeCallerInfo" class="text-muted small"></span>
+                </div>
+                <div class="card-body py-3">
+                    <div class="d-flex flex-wrap gap-2 align-items-start">
+                        <button id="holdBtn" class="btn btn-secondary btn-sm">Hold</button>
+                        <button id="transferBtn" class="btn btn-warning btn-sm">Transfer</button>
+                        <button id="hangupBtn" class="btn btn-danger btn-sm">Hang Up</button>
+                    </div>
+                    <div id="transferPanel" class="d-none mt-3">
+                        <label class="form-label mb-1 small fw-semibold">Transfer to number</label>
+                        <div class="input-group" style="max-width:440px;">
+                            <input type="tel" id="transferNumber" class="form-control form-control-sm"
+                                placeholder="e.g. 262-555-7777 or +1 (262) 555-7777">
+                            <button id="confirmTransferBtn" class="btn btn-danger btn-sm">Transfer</button>
+                            <button id="cancelTransferBtn" class="btn btn-secondary btn-sm">Cancel</button>
+                        </div>
+                        <div id="transferError" class="text-danger small mt-1 d-none"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- Queue Panels -->
         <div class="row">
             <div class="col-md-6 mb-4">
@@ -277,12 +304,18 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <!-- Hidden audio element for remote call audio (required in v4 — no rootElement) -->
+    <audio id="remoteAudio" autoplay></audio>
     <script src="https://cdn.signalwire.com/@signalwire/js"></script>
     <script>
         class CallQueueApp {
             constructor() {
                 this.client = null;
                 this.currentCall = null;
+                this.callerCallSid = null;
+                this.callerFrom = null;
+                this.transferStatus = null;
+                this.isOnHold = false;
                 this.isConnected = false;
                 this.ws = null;
                 this.agentId = null;
@@ -349,13 +382,18 @@
                 document.getElementById('disconnectBtn').addEventListener('click', () => this.disconnectFromSignalWire());
                 document.getElementById('dialSalesBtn').addEventListener('click', () => this.handleQueueButton('sales'));
                 document.getElementById('dialSupportBtn').addEventListener('click', () => this.handleQueueButton('support'));
+                document.getElementById('hangupBtn').addEventListener('click', () => this.hangupCall());
+                document.getElementById('holdBtn').addEventListener('click', () => this.toggleHold());
+                document.getElementById('transferBtn').addEventListener('click', () => this.initiateTransfer());
+                document.getElementById('confirmTransferBtn').addEventListener('click', () => this.confirmTransfer());
+                document.getElementById('cancelTransferBtn').addEventListener('click', () => this.cancelTransfer());
+                document.getElementById('transferNumber').addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') this.confirmTransfer();
+                });
             }
 
             handleQueueButton(queueName) {
-                // If we have an active call on this queue, hang up; otherwise dial
-                if (this.currentCall && this.activeQueue === queueName) {
-                    this.hangupCall();
-                } else if (!this.currentCall) {
+                if (!this.currentCall) {
                     this.dialQueue(queueName);
                 }
             }
@@ -407,6 +445,18 @@
                         break;
 
                     case 'call_dequeued':
+                        this.queues[message.queue] = this.queues[message.queue].filter(
+                            c => c.callSid !== message.callSid
+                        );
+                        // Server assigns each dequeue to a specific agent via FIFO matching —
+                        // only capture if this dequeue was attributed to us
+                        if (message.agentId === this.agentId && this.currentCall) {
+                            this.callerCallSid = message.callSid;
+                            this.callerFrom = message.from || null;
+                        }
+                        this.renderQueues();
+                        break;
+
                     case 'call_left':
                         this.queues[message.queue] = this.queues[message.queue].filter(
                             c => c.callSid !== message.callSid
@@ -533,6 +583,11 @@
                         `).join('');
                     }
                 });
+
+                // Keep dial buttons in sync with queue availability
+                if (!this.currentCall && !this.activeQueue) {
+                    this.resetDialButtons();
+                }
             }
 
             updateWaitTimes() {
@@ -789,10 +844,17 @@
                     this.showStatus('Creating guest token...', 'info');
                     const guestToken = await this.createGuestToken([addressId]);
 
-                    // Initialize SignalWire client
-                    this.client = await SignalWire.SignalWire({
-                        project: projectId,
-                        token: guestToken
+                    // Initialize SignalWire client (v4 API)
+                    this.client = new SignalWire.SignalWire(
+                        new SignalWire.StaticCredentialProvider({ token: guestToken })
+                    );
+
+                    // Connection happens automatically on first observable subscription
+                    await new Promise((resolve, reject) => {
+                        const sub = this.client.ready$.subscribe({
+                            next: (ready) => { if (ready) { sub.unsubscribe(); resolve(); } },
+                            error: reject
+                        });
                     });
 
                     this.isConnected = true;
@@ -802,8 +864,7 @@
                     // Update UI
                     connectBtn.classList.add('d-none');
                     document.getElementById('disconnectBtn').classList.remove('d-none');
-                    document.getElementById('dialSalesBtn').disabled = false;
-                    document.getElementById('dialSupportBtn').disabled = false;
+                    this.resetDialButtons();
 
                     // Show SWML info with appropriate message
                     const swmlInfo = document.getElementById('swmlInfo');
@@ -829,7 +890,8 @@
                             type: 'set_credentials',
                             spaceName: spaceName,
                             projectId: projectId,
-                            apiToken: apiToken
+                            apiToken: apiToken,
+                            phoneNumber: this.serverConfig.phoneNumber || null
                         }));
 
                         this.ws.send(JSON.stringify({
@@ -854,7 +916,18 @@
                     this.hangupCall();
                 }
 
+                if (this.agentId && this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(JSON.stringify({ type: 'agent_leave' }));
+                }
+
+                if (this.client) {
+                    this.client.disconnect();
+                    this.client.destroy();
+                }
+
                 this.client = null;
+                this.agentId = null;
+                this.agentName = null;
                 this.isConnected = false;
                 this.updateSwStatus(false);
 
@@ -890,39 +963,62 @@
 
                     this.activeQueue = queueName;
 
-                    // Dial the agent connector with queue name
+                    // Register with server as dialing this queue for FIFO caller SID correlation
+                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                        this.ws.send(JSON.stringify({
+                            type: 'agent_dialing',
+                            queueName: queueName
+                        }));
+                    }
+
                     // SWML Webhooks use /public/ not /private/
                     const dialTarget = '/public/queue-agent-connector';
 
-                    this.currentCall = await this.client.dial({
-                        to: dialTarget,
-                        video: false,
+                    this.currentCall = await this.client.dial(dialTarget, {
                         audio: true,
+                        video: false,
+                        receiveAudio: true,
                         userVariables: {
                             queue_name: queueName
                         }
                     });
 
-                    // Set up call event handlers
-                    this.currentCall.on('destroy', () => {
-                        this.handleCallEnd();
+                    this.currentCall.remoteStream$.subscribe((stream) => {
+                        if (stream) {
+                            const audioEl = document.getElementById('remoteAudio');
+                            audioEl.srcObject = stream;
+                            audioEl.play().catch(e => console.error('Audio play failed:', e));
+                        }
                     });
 
-                    // Update UI when media is actually connected (audio flowing)
-                    this.currentCall.on('media.connected', () => {
-                        btn.innerHTML = 'Hang Up';
-                        btn.className = 'btn btn-danger btn-dial';
-                        btn.disabled = false;
-                        this.updateAgentStatus('oncall', this.queues[queueName][0]?.from);
-                        this.showStatus(`Connected to ${queueName} queue`, 'success');
+                    const TERMINAL_STATUSES = ['hangup', 'disconnected', 'ended', 'destroy', 'failed', 'canceled', 'bye'];
+                    const statusSub = this.currentCall.status$.subscribe({
+                        next: (status) => {
+                            if (status === 'connected' || status === 'active') {
+                                btn.innerHTML = `Dial ${queueName.charAt(0).toUpperCase() + queueName.slice(1)} Queue`;
+                                btn.className = 'btn btn-success btn-dial';
+                                const callerInfo = this.callerFrom || this.queues[queueName][0]?.from;
+                                this.updateAgentStatus('oncall', callerInfo);
+                                this.showCallControls();
+                                this.showStatus(`Connected to ${queueName} queue`, 'success');
+                            } else if (TERMINAL_STATUSES.includes(status)) {
+                                statusSub.unsubscribe();
+                                this.handleCallEnd();
+                            }
+                        },
+                        complete: () => this.handleCallEnd(),
+                        error: (err) => { console.error('Call status error:', err); this.handleCallEnd(); }
                     });
-
-                    await this.currentCall.start();
-
-                    // Enable button so agent can cancel while connecting
-                    btn.disabled = false;
 
                 } catch (error) {
+                    // Dial failed before bridge — remove from server's dialing list
+                    if (this.activeQueue && this.ws && this.ws.readyState === WebSocket.OPEN) {
+                        this.ws.send(JSON.stringify({
+                            type: 'agent_dial_cancelled',
+                            queueName: this.activeQueue
+                        }));
+                    }
+                    this.activeQueue = null;
                     console.error('Error dialing queue:', error);
                     this.showStatus(`Failed to dial queue: ${error.message}`, 'danger');
                     this.resetDialButtons();
@@ -933,19 +1029,39 @@
                 if (this.currentCall) {
                     try {
                         await this.currentCall.hangup();
+                        // handleCallEnd() will be triggered by the status$ subscription
                     } catch (error) {
                         console.error('Error hanging up:', error);
+                        this.handleCallEnd();
                     }
                 }
-                this.handleCallEnd();
             }
 
             handleCallEnd() {
+                // If the call ended before a bridge was established, we're still in the
+                // dialing list on the server — cancel so the slot isn't orphaned
+                if (this.activeQueue && !this.callerCallSid && this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(JSON.stringify({
+                        type: 'agent_dial_cancelled',
+                        queueName: this.activeQueue
+                    }));
+                }
+
+                const statusMsg = this.transferStatus
+                    ? `Call transferred to ${this.transferStatus}`
+                    : 'Call ended';
+                const statusType = this.transferStatus ? 'success' : 'info';
+
                 this.currentCall = null;
                 this.activeQueue = null;
+                this.callerCallSid = null;
+                this.callerFrom = null;
+                this.transferStatus = null;
+                this.isOnHold = false;
+                this.hideCallControls();
                 this.resetDialButtons();
                 this.updateAgentStatus('available', null);
-                this.showStatus('Call ended', 'info');
+                this.showStatus(statusMsg, statusType);
             }
 
             resetDialButtons() {
@@ -954,11 +1070,140 @@
 
                 salesBtn.innerHTML = 'Dial Sales Queue';
                 salesBtn.className = 'btn btn-success btn-dial';
-                salesBtn.disabled = !this.isConnected;
+                salesBtn.disabled = !this.isConnected || this.queues.sales.length === 0;
 
                 supportBtn.innerHTML = 'Dial Support Queue';
                 supportBtn.className = 'btn btn-success btn-dial';
-                supportBtn.disabled = !this.isConnected;
+                supportBtn.disabled = !this.isConnected || this.queues.support.length === 0;
+            }
+
+            async sendCallCommand(callSid, command, params = {}) {
+                const response = await fetch('/api/call/command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ callSid, command, params })
+                });
+
+                if (!response.ok) {
+                    const err = await response.json();
+                    throw new Error(err.error?.message || err.error || `Command failed: ${response.status}`);
+                }
+
+                return response.json();
+            }
+
+            toE164(input) {
+                if (!input) return null;
+                const digits = input.replace(/\D/g, '');
+                if (digits.length < 7) return null;
+                if (digits.length === 10) return `+1${digits}`;
+                if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+                return `+${digits}`;
+            }
+
+            showCallControls() {
+                const callerInfo = document.getElementById('activeCallerInfo');
+                callerInfo.textContent = this.callerFrom
+                    ? `with ${this.formatPhoneNumber(this.callerFrom)}`
+                    : '';
+                document.getElementById('activeCallPanel').classList.remove('d-none');
+            }
+
+            hideCallControls() {
+                const panel = document.getElementById('activeCallPanel');
+                if (panel) panel.classList.add('d-none');
+                const holdBtn = document.getElementById('holdBtn');
+                if (holdBtn) {
+                    holdBtn.textContent = 'Hold';
+                    holdBtn.className = 'btn btn-secondary btn-sm';
+                    holdBtn.disabled = false;
+                }
+                this.cancelTransfer();
+            }
+
+            async toggleHold() {
+                if (!this.currentCall) return;
+
+                const holdBtn = document.getElementById('holdBtn');
+                holdBtn.disabled = true;
+
+                try {
+                    await this.currentCall.toggleHold();
+                    this.isOnHold = !this.isOnHold;
+
+                    if (this.isOnHold) {
+                        holdBtn.textContent = 'Resume';
+                        holdBtn.className = 'btn btn-success btn-sm';
+                        document.getElementById('transferBtn').disabled = true;
+                    } else {
+                        holdBtn.textContent = 'Hold';
+                        holdBtn.className = 'btn btn-secondary btn-sm';
+                        document.getElementById('transferBtn').disabled = false;
+                    }
+                } catch (error) {
+                    console.error('Hold toggle failed:', error);
+                    this.showStatus(`Hold failed: ${error.message}`, 'danger');
+                } finally {
+                    holdBtn.disabled = false;
+                }
+            }
+
+            initiateTransfer() {
+                document.getElementById('transferPanel').classList.remove('d-none');
+                document.getElementById('transferBtn').disabled = true;
+                document.getElementById('transferNumber').focus();
+            }
+
+            cancelTransfer() {
+                const panel = document.getElementById('transferPanel');
+                if (!panel) return;
+                panel.classList.add('d-none');
+                document.getElementById('transferNumber').value = '';
+                document.getElementById('transferError').classList.add('d-none');
+                const confirmBtn = document.getElementById('confirmTransferBtn');
+                confirmBtn.disabled = false;
+                confirmBtn.textContent = 'Transfer';
+                document.getElementById('transferBtn').disabled = false;
+            }
+
+            async confirmTransfer() {
+                const input = document.getElementById('transferNumber').value.trim();
+                const errorEl = document.getElementById('transferError');
+                errorEl.classList.add('d-none');
+
+                const e164 = this.toE164(input);
+                if (!e164) {
+                    errorEl.textContent = 'Please enter a valid phone number (at least 7 digits).';
+                    errorEl.classList.remove('d-none');
+                    return;
+                }
+
+                if (!this.callerCallSid) {
+                    errorEl.textContent = 'No active call to transfer.';
+                    errorEl.classList.remove('d-none');
+                    return;
+                }
+
+                const confirmBtn = document.getElementById('confirmTransferBtn');
+                confirmBtn.disabled = true;
+                confirmBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Transferring...';
+
+                // Set before the command so handleCallEnd shows the right status
+                this.transferStatus = e164;
+
+                try {
+                    const baseUrl = this.serverConfig.baseUrl.replace(/\/$/, '');
+                    await this.sendCallCommand(this.callerCallSid, 'update', {
+                        url: `${baseUrl}/swml/transfer?to=${encodeURIComponent(e164)}`
+                    });
+                    // Bridge will break, triggering handleCallEnd via destroy event
+                } catch (error) {
+                    this.transferStatus = null;
+                    errorEl.textContent = `Transfer failed: ${error.message}`;
+                    errorEl.classList.remove('d-none');
+                    confirmBtn.disabled = false;
+                    confirmBtn.textContent = 'Transfer';
+                }
             }
 
             updateAgentStatus(status, currentCall) {
