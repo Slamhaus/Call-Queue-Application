@@ -66,7 +66,8 @@ Call_Queue_Dev/
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /api/config` | Returns server configuration for the frontend |
+| `GET /api/config` | Returns whether the server is configured |
+| `POST /api/agent/connect` | Runs SignalWire setup and returns a scoped guest token |
 | `POST /api/call/command` | Proxy for SignalWire REST call commands (hold, transfer) |
 | `POST /swml/ivr` | IVR SWML for inbound calls |
 | `POST /swml/agent-connector` | SWML for agent queue connection |

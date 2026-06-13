@@ -321,7 +321,6 @@
                 this.agentId = null;
                 this.agentName = null;
                 this.activeQueue = null;
-                this.resourceIds = {};
                 this.serverConfig = null;
 
                 this.queues = {
@@ -363,7 +362,7 @@
                         return;
                     }
 
-                    this.serverConfig = data;
+                    this.serverConfig = {};
                     configError.classList.add('d-none');
                     connectBtn.disabled = false;
                     connectBtn.textContent = 'Connect';
@@ -633,149 +632,6 @@
                 document.getElementById('callStatus').classList.add('d-none');
             }
 
-            async checkResourceExists(name, type) {
-                const { spaceName, projectId, apiToken } = this.serverConfig;
-
-                const response = await fetch(`https://${spaceName}/api/fabric/resources`, {
-                    method: 'GET',
-                    headers: {
-                        'Authorization': 'Basic ' + btoa(`${projectId}:${apiToken}`)
-                    }
-                });
-
-                if (!response.ok) throw new Error(`Failed to fetch resources: ${response.status}`);
-
-                const data = await response.json();
-                const resource = data.data?.find(r => r.display_name === name && r.type === type);
-                return resource ? { exists: true, id: resource.id } : { exists: false, id: null };
-            }
-
-            async createSWMLWebhook(name, requestUrl) {
-                const { spaceName, projectId, apiToken } = this.serverConfig;
-
-                const response = await fetch(`https://${spaceName}/api/fabric/resources/swml_webhooks`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': 'Basic ' + btoa(`${projectId}:${apiToken}`)
-                    },
-                    body: JSON.stringify({
-                        name: name,
-                        primary_request_url: requestUrl
-                    })
-                });
-
-                if (!response.ok) {
-                    const errorData = await response.text();
-                    throw new Error(`Failed to create SWML webhook: ${response.status}: ${errorData}`);
-                }
-
-                return await response.json();
-            }
-
-            async updateSWMLWebhook(resourceId, requestUrl) {
-                const { spaceName, projectId, apiToken } = this.serverConfig;
-
-                const response = await fetch(`https://${spaceName}/api/fabric/resources/swml_webhooks/${resourceId}`, {
-                    method: 'PUT',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': 'Basic ' + btoa(`${projectId}:${apiToken}`)
-                    },
-                    body: JSON.stringify({
-                        primary_request_url: requestUrl
-                    })
-                });
-
-                if (!response.ok) {
-                    const errorData = await response.text();
-                    throw new Error(`Failed to update SWML webhook: ${response.status}: ${errorData}`);
-                }
-
-                return await response.json();
-            }
-
-            async getSWMLWebhookAddresses(resourceId) {
-                const { spaceName, projectId, apiToken } = this.serverConfig;
-
-                const response = await fetch(`https://${spaceName}/api/fabric/resources/swml_webhooks/${resourceId}/addresses`, {
-                    method: 'GET',
-                    headers: {
-                        'Authorization': 'Basic ' + btoa(`${projectId}:${apiToken}`)
-                    }
-                });
-
-                if (!response.ok) throw new Error(`Failed to fetch addresses: ${response.status}`);
-
-                const data = await response.json();
-                return data.data?.[0]?.id || null;
-            }
-
-            async createGuestToken(allowedAddresses) {
-                const { spaceName, projectId, apiToken } = this.serverConfig;
-
-                const response = await fetch(`https://${spaceName}/api/fabric/guests/tokens`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': 'Basic ' + btoa(`${projectId}:${apiToken}`)
-                    },
-                    body: JSON.stringify({
-                        allowed_addresses: allowedAddresses
-                    })
-                });
-
-                if (!response.ok) throw new Error(`Failed to create guest token: ${response.status}`);
-
-                const data = await response.json();
-                return data.token;
-            }
-
-            async getPhoneNumberId(phoneNumber) {
-                const { spaceName, projectId, apiToken } = this.serverConfig;
-
-                const response = await fetch(`https://${spaceName}/api/relay/rest/phone_numbers?filter_number=${encodeURIComponent(phoneNumber)}`, {
-                    method: 'GET',
-                    headers: {
-                        'Authorization': 'Basic ' + btoa(`${projectId}:${apiToken}`)
-                    }
-                });
-
-                if (!response.ok) throw new Error(`Failed to fetch phone numbers: ${response.status}`);
-
-                const data = await response.json();
-                const phoneNumberData = data.data?.find(p => p.number === phoneNumber);
-
-                if (!phoneNumberData) {
-                    throw new Error(`Phone number ${phoneNumber} not found in your SignalWire account`);
-                }
-
-                return phoneNumberData.id;
-            }
-
-            async assignIvrToPhoneNumber(phoneNumberId, ivrUrl) {
-                const { spaceName, projectId, apiToken } = this.serverConfig;
-
-                const response = await fetch(`https://${spaceName}/api/relay/rest/phone_numbers/${phoneNumberId}`, {
-                    method: 'PUT',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': 'Basic ' + btoa(`${projectId}:${apiToken}`)
-                    },
-                    body: JSON.stringify({
-                        call_handler: 'relay_script',
-                        call_relay_script_url: ivrUrl
-                    })
-                });
-
-                if (!response.ok) {
-                    const errorData = await response.text();
-                    throw new Error(`Failed to assign IVR to phone number: ${response.status}: ${errorData}`);
-                }
-
-                return await response.json();
-            }
-
             async connectToSignalWire() {
                 const connectBtn = document.getElementById('connectBtn');
 
@@ -784,72 +640,29 @@
                     connectBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Connecting...';
 
                     const agentNameInput = document.getElementById('agentName').value.trim();
+                    if (!agentNameInput) throw new Error('Agent name is required');
 
-                    if (!agentNameInput) {
-                        throw new Error('Agent name is required');
+                    this.showStatus('Setting up...', 'info');
+
+                    const response = await fetch('/api/agent/connect', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ agentName: agentNameInput })
+                    });
+
+                    if (!response.ok) {
+                        const err = await response.json();
+                        throw new Error(err.error || `Setup failed: ${response.status}`);
                     }
 
-                    if (!this.serverConfig) {
-                        throw new Error('Server configuration not loaded');
-                    }
+                    const { token, baseUrl, phoneNumber } = await response.json();
+                    this.serverConfig = { baseUrl, phoneNumber };
 
-                    const { spaceName, projectId, apiToken, baseUrl: serverBaseUrl } = this.serverConfig;
-                    const baseUrl = serverBaseUrl.replace(/\/$/, '');
-
-                    // Create or update IVR webhook resource
-                    this.showStatus('Checking IVR resource...', 'info');
-                    let ivrResource = await this.checkResourceExists('queue-inbound-ivr', 'swml_webhook');
-
-                    if (!ivrResource.exists) {
-                        this.showStatus('Creating IVR webhook...', 'info');
-                        const created = await this.createSWMLWebhook('queue-inbound-ivr', `${baseUrl}/swml/ivr`);
-                        this.resourceIds.ivr = created.id;
-                    } else {
-                        this.showStatus('Updating IVR webhook URL...', 'info');
-                        await this.updateSWMLWebhook(ivrResource.id, `${baseUrl}/swml/ivr`);
-                        this.resourceIds.ivr = ivrResource.id;
-                    }
-
-                    // Assign IVR to phone number if configured
-                    if (this.serverConfig.phoneNumber) {
-                        this.showStatus('Assigning IVR to phone number...', 'info');
-                        const phoneNumberId = await this.getPhoneNumberId(this.serverConfig.phoneNumber);
-                        await this.assignIvrToPhoneNumber(phoneNumberId, `${baseUrl}/swml/ivr`);
-                        console.log(`IVR assigned to ${this.serverConfig.phoneNumber}`);
-                    }
-
-                    // Create or update agent connector webhook resource
-                    this.showStatus('Checking agent connector resource...', 'info');
-                    let agentResource = await this.checkResourceExists('queue-agent-connector', 'swml_webhook');
-
-                    if (!agentResource.exists) {
-                        this.showStatus('Creating agent connector webhook...', 'info');
-                        const created = await this.createSWMLWebhook('queue-agent-connector', `${baseUrl}/swml/agent-connector`);
-                        this.resourceIds.agent = created.id;
-                    } else {
-                        this.showStatus('Updating agent connector webhook URL...', 'info');
-                        await this.updateSWMLWebhook(agentResource.id, `${baseUrl}/swml/agent-connector`);
-                        this.resourceIds.agent = agentResource.id;
-                    }
-
-                    // Get address for agent connector
-                    this.showStatus('Getting resource address...', 'info');
-                    const addressId = await this.getSWMLWebhookAddresses(this.resourceIds.agent);
-
-                    if (!addressId) {
-                        throw new Error('Could not get address for agent connector resource');
-                    }
-
-                    // Create guest token
-                    this.showStatus('Creating guest token...', 'info');
-                    const guestToken = await this.createGuestToken([addressId]);
-
-                    // Initialize SignalWire client (v4 API)
+                    this.showStatus('Connecting to SignalWire...', 'info');
                     this.client = new SignalWire.SignalWire(
-                        new SignalWire.StaticCredentialProvider({ token: guestToken })
+                        new SignalWire.StaticCredentialProvider({ token })
                     );
 
-                    // Connection happens automatically on first observable subscription
                     await new Promise((resolve, reject) => {
                         const sub = this.client.ready$.subscribe({
                             next: (ready) => { if (ready) { sub.unsubscribe(); resolve(); } },
@@ -861,39 +674,27 @@
                     this.updateSwStatus(true);
                     this.hideStatus();
 
-                    // Update UI
                     connectBtn.classList.add('d-none');
                     document.getElementById('disconnectBtn').classList.remove('d-none');
                     this.resetDialButtons();
 
-                    // Show SWML info with appropriate message
                     const swmlInfo = document.getElementById('swmlInfo');
                     const swmlTitle = document.getElementById('swmlInfoTitle');
                     const swmlMessage = document.getElementById('swmlInfoMessage');
 
-                    if (this.serverConfig.phoneNumber) {
+                    if (phoneNumber) {
                         swmlTitle.textContent = 'IVR Assigned!';
-                        swmlMessage.innerHTML = `The IVR is now assigned to <code>${this.serverConfig.phoneNumber}</code>. Incoming calls will be routed to the queue.`;
+                        swmlMessage.innerHTML = `The IVR is now assigned to <code>${phoneNumber}</code>. Incoming calls will be routed to the queue.`;
                     } else {
                         swmlTitle.textContent = 'IVR Resource Ready!';
                         swmlMessage.innerHTML = 'Assign the resource <code>queue-inbound-ivr</code> to your phone number in the SignalWire dashboard.';
                     }
                     swmlInfo.classList.remove('d-none');
 
-                    // Set agent info and join
                     this.agentName = agentNameInput;
                     this.agentId = 'agent_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
 
-                    // Send credentials and join as agent
                     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                        this.ws.send(JSON.stringify({
-                            type: 'set_credentials',
-                            spaceName: spaceName,
-                            projectId: projectId,
-                            apiToken: apiToken,
-                            phoneNumber: this.serverConfig.phoneNumber || null
-                        }));
-
                         this.ws.send(JSON.stringify({
                             type: 'agent_join',
                             agentId: this.agentId,

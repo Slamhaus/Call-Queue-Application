@@ -212,16 +212,6 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify(getFullState()));
                     break;
 
-                case 'set_credentials':
-                    state.signalwireCredentials = {
-                        spaceName: message.spaceName,
-                        projectId: message.projectId,
-                        apiToken: message.apiToken,
-                        // Preserve phoneNumber from env if client doesn't supply one
-                        phoneNumber: message.phoneNumber || state.signalwireCredentials?.phoneNumber || null
-                    };
-                    console.log('SignalWire credentials stored for API calls');
-                    break;
             }
         } catch (err) {
             console.error('WebSocket message error:', err);
@@ -474,25 +464,120 @@ function handleTransferSwml(req, res) {
 app.post('/swml/transfer', handleTransferSwml);
 app.get('/swml/transfer', handleTransferSwml);
 
-// Config endpoint - returns credentials and detected base URL for frontend
+// Config endpoint - tells the frontend whether the server is configured
 app.get('/api/config', (req, res) => {
-    const baseUrl = getBaseUrl(req);
-
     if (!state.signalwireCredentials) {
-        return res.status(503).json({
+        return res.json({
             configured: false,
             error: 'SignalWire credentials not configured. Please set SIGNALWIRE_PROJECT_ID, SIGNALWIRE_API_TOKEN, and SIGNALWIRE_SPACE_NAME in .env file.'
         });
     }
+    res.json({ configured: true });
+});
 
-    res.json({
-        configured: true,
-        baseUrl: baseUrl,
-        spaceName: state.signalwireCredentials.spaceName,
-        projectId: state.signalwireCredentials.projectId,
-        apiToken: state.signalwireCredentials.apiToken,
-        phoneNumber: state.signalwireCredentials.phoneNumber
+// Agent connect — runs the full SignalWire setup server-side and returns
+// only a scoped guest token to the browser (credentials never leave the server)
+app.post('/api/agent/connect', async (req, res) => {
+    if (!state.signalwireCredentials) {
+        return res.status(503).json({ error: 'SignalWire credentials not configured' });
+    }
+
+    const { spaceName, projectId, apiToken, phoneNumber } = state.signalwireCredentials;
+    const baseUrl = getBaseUrl(req);
+    const authHeader = 'Basic ' + Buffer.from(`${projectId}:${apiToken}`).toString('base64');
+
+    const swFetch = (path, opts = {}) => fetch(`https://${spaceName}${path}`, {
+        ...opts,
+        headers: { 'Authorization': authHeader, ...(opts.headers || {}) }
     });
+
+    try {
+        // Fetch existing fabric resources once
+        const resourcesRes = await swFetch('/api/fabric/resources');
+        if (!resourcesRes.ok) throw new Error(`Failed to fetch resources: ${resourcesRes.status}`);
+        const resources = (await resourcesRes.json()).data || [];
+        const findResource = (name, type) => resources.find(r => r.display_name === name && r.type === type);
+
+        // Ensure IVR webhook exists and points to the current URL
+        const ivrExisting = findResource('queue-inbound-ivr', 'swml_webhook');
+        let ivrId;
+        if (!ivrExisting) {
+            const r = await swFetch('/api/fabric/resources/swml_webhooks', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'queue-inbound-ivr', primary_request_url: `${baseUrl}/swml/ivr` })
+            });
+            if (!r.ok) throw new Error(`Failed to create IVR webhook: ${r.status}`);
+            ivrId = (await r.json()).id;
+        } else {
+            ivrId = ivrExisting.id;
+            const r = await swFetch(`/api/fabric/resources/swml_webhooks/${ivrId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ primary_request_url: `${baseUrl}/swml/ivr` })
+            });
+            if (!r.ok) throw new Error(`Failed to update IVR webhook: ${r.status}`);
+        }
+
+        // Assign IVR to phone number if configured
+        if (phoneNumber) {
+            const pnRes = await swFetch(`/api/relay/rest/phone_numbers?filter_number=${encodeURIComponent(phoneNumber)}`);
+            if (!pnRes.ok) throw new Error(`Failed to fetch phone numbers: ${pnRes.status}`);
+            const pn = (await pnRes.json()).data?.find(p => p.number === phoneNumber);
+            if (!pn) throw new Error(`Phone number ${phoneNumber} not found in your SignalWire account`);
+
+            const assignRes = await swFetch(`/api/relay/rest/phone_numbers/${pn.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ call_handler: 'relay_script', call_relay_script_url: `${baseUrl}/swml/ivr` })
+            });
+            if (!assignRes.ok) throw new Error(`Failed to assign IVR to phone number: ${assignRes.status}`);
+            console.log(`IVR assigned to ${phoneNumber}`);
+        }
+
+        // Ensure agent connector webhook exists and points to the current URL
+        const agentExisting = findResource('queue-agent-connector', 'swml_webhook');
+        let agentResourceId;
+        if (!agentExisting) {
+            const r = await swFetch('/api/fabric/resources/swml_webhooks', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'queue-agent-connector', primary_request_url: `${baseUrl}/swml/agent-connector` })
+            });
+            if (!r.ok) throw new Error(`Failed to create agent connector webhook: ${r.status}`);
+            agentResourceId = (await r.json()).id;
+        } else {
+            agentResourceId = agentExisting.id;
+            const r = await swFetch(`/api/fabric/resources/swml_webhooks/${agentResourceId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ primary_request_url: `${baseUrl}/swml/agent-connector` })
+            });
+            if (!r.ok) throw new Error(`Failed to update agent connector webhook: ${r.status}`);
+        }
+
+        // Get the address ID needed to scope the guest token
+        const addrRes = await swFetch(`/api/fabric/resources/swml_webhooks/${agentResourceId}/addresses`);
+        if (!addrRes.ok) throw new Error(`Failed to fetch addresses: ${addrRes.status}`);
+        const addressId = (await addrRes.json()).data?.[0]?.id;
+        if (!addressId) throw new Error('Could not get address for agent connector resource');
+
+        // Issue a scoped guest token — this is the only credential the browser receives
+        const tokenRes = await swFetch('/api/fabric/guests/tokens', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ allowed_addresses: [addressId] })
+        });
+        if (!tokenRes.ok) throw new Error(`Failed to create guest token: ${tokenRes.status}`);
+        const { token } = await tokenRes.json();
+
+        console.log(`[${new Date().toISOString()}] Agent connect setup complete, guest token issued`);
+        res.json({ token, baseUrl, phoneNumber: phoneNumber || null });
+
+    } catch (error) {
+        console.error('Agent connect error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
 });
 
 // Call command proxy - authenticates and forwards REST call commands to SignalWire
