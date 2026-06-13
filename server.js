@@ -462,7 +462,6 @@ function handleTransferSwml(req, res) {
 }
 
 app.post('/swml/transfer', handleTransferSwml);
-app.get('/swml/transfer', handleTransferSwml);
 
 // Config endpoint - tells the frontend whether the server is configured
 app.get('/api/config', (req, res) => {

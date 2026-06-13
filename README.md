@@ -72,7 +72,6 @@ Call_Queue_Dev/
 | `POST /swml/ivr` | IVR SWML for inbound calls |
 | `POST /swml/agent-connector` | SWML for agent queue connection |
 | `POST /swml/transfer` | SWML executed when transferring a caller to a PSTN number |
-| `GET  /swml/transfer` | Same as above (SignalWire may fetch via GET) |
 | `POST /webhook/queue-status` | Receives queue events from SignalWire |
 | `GET /health` | Health check |
 | `GET /debug/state` | View current queue and agent state |
